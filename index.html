@@ -817,129 +817,199 @@ async function parseFbaFile(file) {
 }
 
 // ─── PARSE FC FILE ────────────────────────────────────────
-// Detect date-like column headers
-function isDateHeader(h) {
-  const s = String(h||'').trim();
-  if (!s) return false;
-  // Matches: MM/DD/YYYY, YYYY-MM-DD, DD-Mon-YYYY, "Jan 2024", "2024-01", etc.
-  return /\d{4}[-/]\d{1,2}[-/]\d{1,2}/.test(s)
-    || /\d{1,2}[-/]\d{1,2}[-/]\d{2,4}/.test(s)
-    || /\d{1,2}[-\s](jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)/i.test(s)
-    || /(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[\s-]\d{2,4}/i.test(s)
-    || /^\d{5}$/.test(s); // Excel serial date
+
+// Helper: find column index in a header array, by exact then partial match
+function findColInHeaders(headers, ...candidates) {
+  for (const cand of candidates) {
+    const idx = headers.findIndex(h => norm(h) === norm(cand));
+    if (idx !== -1) return idx;
+  }
+  for (const cand of candidates) {
+    const idx = headers.findIndex(h => norm(h).includes(norm(cand)));
+    if (idx !== -1) return idx;
+  }
+  return -1;
 }
 
-function parseExcelDate(h) {
-  const s = String(h).trim();
-  // Excel serial number
-  if (/^\d{5}$/.test(s)) {
-    const d = XLSX.SSF.parse_date_code(Number(s));
-    return new Date(d.y, d.m-1, d.d);
+// Helper: scan up to 10 rows to find the header row containing an ASIN-like column
+function findHeaderRow(raw) {
+  const asinTerms = ['asin', 'item asin', 'product asin', 'asin number'];
+  for (let i = 0; i < Math.min(10, raw.length); i++) {
+    const row = raw[i].map(c => String(c || '').trim());
+    if (row.some(h => asinTerms.some(t => norm(h) === t || norm(h).includes('asin')))) {
+      return { headerRowIdx: i, headers: row };
+    }
   }
-  const d = new Date(s);
-  if (!isNaN(d)) return d;
   return null;
+}
+
+// Helper: is a cell value a date? (JS Date object or Excel serial number 40000–50000)
+function cellIsDate(v) {
+  if (v instanceof Date && !isNaN(v)) return true;
+  if (typeof v === 'number' && v > 40000 && v < 60000) return true;
+  if (typeof v === 'string') {
+    const s = v.trim();
+    if (/^\d{4}[-\/]\d{1,2}[-\/]\d{1,2}/.test(s)) return true;
+    if (/^\d{1,2}[-\/]\d{1,2}[-\/]\d{2,4}/.test(s)) return true;
+    if (/(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)/i.test(s) && /\d{4}/.test(s)) return true;
+  }
+  return false;
+}
+
+function toJsDate(v) {
+  if (v instanceof Date) return v;
+  if (typeof v === 'number') {
+    // Excel serial → JS date
+    const d = new Date(Math.round((v - 25569) * 86400 * 1000));
+    return d;
+  }
+  const d = new Date(String(v));
+  return isNaN(d) ? null : d;
+}
+
+function formatDateLabel(v) {
+  const d = toJsDate(v);
+  if (!d || isNaN(d)) return String(v);
+  return d.toLocaleDateString('en-IN', { day: '2-digit', month: 'short', year: 'numeric' });
 }
 
 async function parseFcFile(file) {
   const ext = file.name.split('.').pop().toLowerCase();
-  if (ext === 'csv') throw new Error('FC Inventory file must be Excel (.xlsx or .xls) with 2 sheets.');
+  if (ext === 'csv') throw new Error('FC Inventory file must be an Excel file (.xlsx or .xls) with multiple sheets.');
 
   const buf = await readFileAsArrayBuffer(file);
+
+  // cellDates:true converts Excel date serials to JS Date objects automatically
   const wb = XLSX.read(buf, { type: 'array', cellDates: true });
 
-  if (wb.SheetNames.length < 2) throw new Error('FC file must have at least 2 sheets (Sellable and Unsellable).');
+  const sheetNames = wb.SheetNames;
+  if (sheetNames.length < 2) {
+    throw new Error(`FC file needs at least 2 sheets. Found: ${sheetNames.join(', ')}`);
+  }
 
-  // ── Sheet 1: Sellable ──
-  const sellableWs = wb.Sheets[wb.SheetNames[0]];
-  const sellableRows = XLSX.utils.sheet_to_json(sellableWs, { defval: '' });
-  if (!sellableRows.length) throw new Error('FC Sellable sheet is empty.');
+  // ── Find the Sellable and Unsellable sheets by name (flexible matching) ──
+  const sellableSheetName = sheetNames.find(n =>
+    norm(n).includes('sellable') && !norm(n).includes('unsellable')
+  ) || sheetNames[0];
 
-  const sHeaders = Object.keys(sellableRows[0]);
-  const sAsinIdx = findCol(sHeaders, 'asin');
-  const sSkuIdx  = findCol(sHeaders, 'sku', 'seller sku', 'seller-sku');
-  const sSellIdx = findCol(sHeaders, 'sellable', 'sellable quantity', 'quantity', 'qty');
+  const unsellableSheetName = sheetNames.find(n =>
+    norm(n).includes('unsellable')
+  ) || sheetNames[1];
 
-  if (sAsinIdx === -1) throw new Error('FC Sellable sheet: Cannot find "asin" column.');
-  if (sSkuIdx  === -1) throw new Error('FC Sellable sheet: Cannot find "sku" column.');
-  if (sSellIdx === -1) throw new Error('FC Sellable sheet: Cannot find "sellable" or "quantity" column.');
+  // ──────────────────────────────────────────────────
+  // SHEET: Sellable
+  // ──────────────────────────────────────────────────
+  const sellableRaw = XLSX.utils.sheet_to_json(wb.Sheets[sellableSheetName], { header: 1, defval: '' });
+  if (!sellableRaw.length) throw new Error(`FC Sellable sheet ("${sellableSheetName}") is empty.`);
+
+  const sHeaderResult = findHeaderRow(sellableRaw);
+  if (!sHeaderResult) {
+    const preview = sellableRaw.slice(0,3).map(r => r.slice(0,6).join(' | ')).join('\n');
+    throw new Error(`FC Sellable sheet ("${sellableSheetName}"): Cannot find a row containing "ASIN".\nFirst rows preview:\n${preview}`);
+  }
+  const { headerRowIdx: sHeaderIdx, headers: sHeaders } = sHeaderResult;
+
+  const sAsinIdx = findColInHeaders(sHeaders, 'asin', 'item asin', 'product asin');
+  const sSkuIdx  = findColInHeaders(sHeaders, 'sku', 'seller sku', 'seller-sku', 'msku');
+  const sSellIdx = findColInHeaders(sHeaders, 'sellable stock', 'sellable', 'quantity', 'qty', 'available', 'stock');
+
+  const sErrors = [];
+  if (sAsinIdx === -1) sErrors.push(`ASIN column not found. Columns found: [${sHeaders.filter(Boolean).join(', ')}]`);
+  if (sSkuIdx  === -1) sErrors.push(`SKU column not found. Columns found: [${sHeaders.filter(Boolean).join(', ')}]`);
+  if (sSellIdx === -1) sErrors.push(`Sellable/Quantity column not found. Columns found: [${sHeaders.filter(Boolean).join(', ')}]`);
+  if (sErrors.length) throw new Error(`FC Sellable sheet ("${sellableSheetName}"):\n• ${sErrors.join('\n• ')}`);
 
   const sellableMap = new Map();
-  for (const row of sellableRows) {
-    const vals = Object.values(row);
-    const asin = String(vals[sAsinIdx]||'').trim();
-    if (!asin || asin.length < 5) continue;
-    sellableMap.set(asin, {
-      sku:      String(vals[sSkuIdx]||'').trim(),
-      sellable: safeNum(vals[sSellIdx])
-    });
+  for (let r = sHeaderIdx + 1; r < sellableRaw.length; r++) {
+    const row = sellableRaw[r];
+    const asin = String(row[sAsinIdx] || '').trim();
+    if (!asin || asin.length < 5 || !asin.startsWith('B0') && !/^[A-Z0-9]{10}$/.test(asin)) continue;
+    const sku = String(row[sSkuIdx] || '').trim();
+    const sellable = safeNum(row[sSellIdx]);
+    sellableMap.set(asin, { sku, sellable });
   }
-  if (!sellableMap.size) throw new Error('FC Sellable sheet: No valid rows found.');
+  if (!sellableMap.size) throw new Error(`FC Sellable sheet ("${sellableSheetName}"): No valid ASIN rows found after the header row.`);
 
-  // ── Sheet 2: Unsellable ──
-  const unsellableWs = wb.Sheets[wb.SheetNames[1]];
-  // Use raw to get header row properly
-  const unsellableRaw = XLSX.utils.sheet_to_json(unsellableWs, { header: 1, defval: '' });
-  if (!unsellableRaw.length) throw new Error('FC Unsellable sheet is empty.');
+  // ──────────────────────────────────────────────────
+  // SHEET: Unsellable
+  // ──────────────────────────────────────────────────
+  const unsellableRaw = XLSX.utils.sheet_to_json(wb.Sheets[unsellableSheetName], { header: 1, defval: '' });
+  if (!unsellableRaw.length) throw new Error(`FC Unsellable sheet ("${unsellableSheetName}") is empty.`);
 
-  // Find header row (first row with data)
-  let headerRowIdx = 0;
-  for (let i = 0; i < Math.min(5, unsellableRaw.length); i++) {
-    if (unsellableRaw[i].some(c => String(c).trim())) { headerRowIdx = i; break; }
+  const uHeaderResult = findHeaderRow(unsellableRaw);
+  if (!uHeaderResult) {
+    const preview = unsellableRaw.slice(0,3).map(r => r.slice(0,6).join(' | ')).join('\n');
+    throw new Error(`FC Unsellable sheet ("${unsellableSheetName}"): Cannot find a row containing "ASIN".\nFirst rows preview:\n${preview}`);
   }
-  const uHeaders = unsellableRaw[headerRowIdx].map(h => String(h||'').trim());
+  const { headerRowIdx: uHeaderIdx, headers: uHeaders } = uHeaderResult;
 
-  // Find ASIN col
-  const uAsinIdx = uHeaders.findIndex(h => norm(h) === 'asin' || norm(h).includes('asin'));
-  if (uAsinIdx === -1) throw new Error('FC Unsellable sheet: Cannot find "asin" column.');
+  const uAsinIdx = findColInHeaders(uHeaders, 'asin', 'item asin', 'product asin');
+  if (uAsinIdx === -1) {
+    throw new Error(`FC Unsellable sheet ("${unsellableSheetName}"): ASIN column not found. Columns found: [${uHeaders.filter(Boolean).join(', ')}]`);
+  }
 
-  // Find date columns
+  // Find date columns: look at header row values — they'll be JS Date objects (cellDates:true) or date-like strings
+  const headerRowRaw = unsellableRaw[uHeaderIdx]; // raw cell values before string conversion
   const dateCols = [];
-  uHeaders.forEach((h, i) => {
-    if (i === uAsinIdx) return;
-    if (isDateHeader(h)) {
-      const d = parseExcelDate(h);
-      dateCols.push({ idx: i, header: h, date: d });
+  headerRowRaw.forEach((cellVal, colIdx) => {
+    if (colIdx === uAsinIdx) return;
+    if (!cellVal && cellVal !== 0) return;
+    if (cellIsDate(cellVal)) {
+      const d = toJsDate(cellVal);
+      dateCols.push({ idx: colIdx, rawVal: cellVal, date: d, label: formatDateLabel(cellVal) });
     }
   });
 
-  // Try date cols; if none found, look for any numeric-looking columns that aren't ASIN/SKU
-  let latestCol = null;
-  if (dateCols.length > 0) {
-    // Filter to those with parsed dates; pick latest
-    const withDates = dateCols.filter(c => c.date instanceof Date && !isNaN(c.date));
+  // Fallback: if no date columns found via cellDates, try reading the sheet without cellDates
+  // and look for numeric date serials or string dates
+  let latestCol;
+  if (dateCols.length === 0) {
+    // Try reading as raw (no date conversion) to catch serial numbers stored as plain numbers
+    const rawWb = XLSX.read(buf, { type: 'array', cellDates: false });
+    const rawUnsellable = XLSX.utils.sheet_to_json(rawWb.Sheets[unsellableSheetName], { header: 1, defval: '' });
+    const rawHeaderRow = rawUnsellable[uHeaderIdx] || [];
+    rawHeaderRow.forEach((cellVal, colIdx) => {
+      if (colIdx === uAsinIdx) return;
+      if (cellIsDate(cellVal)) {
+        const d = toJsDate(cellVal);
+        dateCols.push({ idx: colIdx, rawVal: cellVal, date: d, label: formatDateLabel(cellVal) });
+      }
+    });
+  }
+
+  if (dateCols.length === 0) {
+    // Last resort: use the last non-ASIN, non-SKU numeric-looking column
+    const skipIdxs = new Set([uAsinIdx, findColInHeaders(uHeaders, 'sku', 'seller sku')].filter(i => i !== -1));
+    // find non-empty non-skip cols
+    const fallbackCols = uHeaders
+      .map((h, i) => ({ idx: i, header: h }))
+      .filter(({ idx, header }) => !skipIdxs.has(idx) && String(header).trim());
+    if (fallbackCols.length) {
+      const last = fallbackCols[fallbackCols.length - 1];
+      latestCol = { idx: last.idx, label: last.header };
+    } else {
+      throw new Error(`FC Unsellable sheet ("${unsellableSheetName}"): No date columns found. Column headers: [${uHeaders.filter(Boolean).join(', ')}]`);
+    }
+  } else {
+    // Pick the latest date
+    const withDates = dateCols.filter(c => c.date && !isNaN(c.date));
     if (withDates.length > 0) {
       latestCol = withDates.reduce((best, c) => c.date > best.date ? c : best);
     } else {
-      // Use last date-header by position
       latestCol = dateCols[dateCols.length - 1];
     }
-  } else {
-    // Fallback: look for any column that looks like a quantity (not asin/sku)
-    const skipCols = new Set([uAsinIdx, uHeaders.findIndex(h => norm(h).includes('sku'))]);
-    const numericCols = uHeaders
-      .map((h, i) => ({ idx: i, header: h }))
-      .filter(({idx, header}) => !skipCols.has(idx) && header && idx !== uAsinIdx);
-    if (numericCols.length) {
-      latestCol = numericCols[numericCols.length - 1];
-    } else {
-      throw new Error('FC Unsellable sheet: No date columns found. Ensure column headers contain dates (e.g. 2024-01-15, 15/01/2024).');
-    }
   }
-
-  const detectedDateLabel = latestCol.header;
 
   // Build unsellable map
   const unsellableMap = new Map();
-  for (let r = headerRowIdx + 1; r < unsellableRaw.length; r++) {
+  for (let r = uHeaderIdx + 1; r < unsellableRaw.length; r++) {
     const row = unsellableRaw[r];
-    const asin = String(row[uAsinIdx]||'').trim();
+    const asin = String(row[uAsinIdx] || '').trim();
     if (!asin || asin.length < 5) continue;
-    const val = safeNum(row[latestCol.idx]);
-    unsellableMap.set(asin, val);
+    unsellableMap.set(asin, safeNum(row[latestCol.idx]));
   }
 
-  return { sellableMap, unsellableMap, detectedDateLabel };
+  return { sellableMap, unsellableMap, detectedDateLabel: latestCol.label };
 }
 
 // ─── MERGE & JOIN ─────────────────────────────────────────
