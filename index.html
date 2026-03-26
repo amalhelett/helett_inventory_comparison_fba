@@ -336,7 +336,11 @@
     border-radius: var(--radius);
     overflow: hidden;
   }
-  .table-scroll { overflow-x: auto; }
+  .table-scroll {
+    overflow-x: auto;
+    overflow-y: auto;
+    max-height: 600px;
+  }
 
   table { width: 100%; border-collapse: collapse; font-size: 13.5px; }
 
@@ -348,10 +352,14 @@
     font-weight: 600;
     text-transform: uppercase;
     letter-spacing: 0.8px;
-    color: var(--text2);            /* lighter than before */
+    color: var(--text2);
     border-bottom: 1px solid var(--border);
     white-space: nowrap;
     user-select: none;
+    position: sticky;
+    top: 0;
+    z-index: 10;
+    box-shadow: 0 1px 0 var(--border);
   }
   thead th.sortable { cursor: pointer; }
   thead th.sortable:hover { color: var(--text); }
@@ -431,7 +439,7 @@
 <body>
 
 <header class="header">
-  <div class="header-logo">Inventory<span> Analyzer</span></div>
+  <div class="header-logo">Helett <span>Inventory Analyzer</span></div>
   <div class="header-tag">FBA + FC</div>
 </header>
 
@@ -1084,9 +1092,9 @@ function renderCharts() {
       labels: ['FBA Available', 'FC Sellable'],
       datasets: [{
         data: [totalFbaSell, totalFcSell],
-        backgroundColor: ['rgba(74,158,255,0.75)', 'rgba(245,200,66,0.75)'],
+        backgroundColor: ['#4a9eff', '#f5c842'],
         borderColor:     ['#4a9eff', '#f5c842'],
-        borderWidth: 1.5,
+        borderWidth: 0,
         borderRadius: 5
       }]
     },
@@ -1100,16 +1108,16 @@ function renderCharts() {
     }
   });
 
-  // Chart 2: Doughnut — Unsellable
+  // Chart 2: Doughnut — Unsellable (purple + teal, solid, clearly distinct)
   state.charts.unsellable = new Chart(document.getElementById('chart-unsellable'), {
     type: 'doughnut',
     data: {
       labels: ['FBA Unfulfillable', 'FC Unsellable'],
       datasets: [{
         data: [totalFbaUns, totalFcUns],
-        backgroundColor: ['rgba(240,82,82,0.8)', 'rgba(245,124,66,0.8)'],
-        borderColor: ['#f05252', '#f57c42'],
-        borderWidth: 1.5
+        backgroundColor: ['#a855f7', '#06b6d4'],
+        borderColor:     ['#a855f7', '#06b6d4'],
+        borderWidth: 0
       }]
     },
     options: {
