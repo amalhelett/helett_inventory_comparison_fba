@@ -431,7 +431,7 @@
 <body>
 
 <header class="header">
-  <div class="header-logo">Helett <span>Inventory Analyzer</span></div>
+  <div class="header-logo">Inventory<span> Analyzer</span></div>
   <div class="header-tag">FBA + FC</div>
 </header>
 
@@ -972,11 +972,16 @@ function mergeData(fbaMap, sellableMap, unsellableMap) {
 }
 
 function getStatus(row) {
+  // Stock level based on FBA available units
   let base;
-  if (row.fba_available === 0) base = 'out';
-  else if (row.fba_available < 10) base = 'low';
-  else base = 'healthy';
-  const issue = row.total_unsellable > 0;
+  if (row.fba_available === 0)        base = 'out';
+  else if (row.fba_available < 50)    base = 'low';
+  else                                base = 'healthy';
+
+  // Issue flag: only raise when unsellable units EXCEED total sellable
+  // i.e. you have more bad stock sitting than good stock available
+  const issue = row.total_unsellable > 0 && row.total_unsellable > row.total_sellable;
+
   return { base, issue };
 }
 
